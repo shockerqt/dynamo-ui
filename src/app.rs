@@ -1,179 +1,177 @@
-use std::io;
-
 use color_eyre::Result;
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
-use ratatui::{
-    buffer::Buffer,
-    layout::Rect,
-    style::Stylize,
-    symbols::border,
-    text::{Line, Text},
-    widgets::{Block, ListState, Paragraph, Widget},
-    DefaultTerminal, Frame,
+use crossterm::event::KeyEvent;
+use ratatui::prelude::Rect;
+use serde::{Deserialize, Serialize};
+use tokio::sync::mpsc;
+use tracing::{debug, info};
+
+use crate::{
+    action::Action,
+    components::{Component, fps::FpsCounter, home::Home},
+    config::Config,
+    tui::{Event, Tui},
 };
 
-/// The main application which holds the state and logic of the application.
-#[derive(Debug, Default)]
 pub struct App {
-    /// Is the application running?
-    pub running: bool,
-    pub counter: u8,
-    todo_list: TodoList,
+    config: Config,
+    tick_rate: f64,
+    frame_rate: f64,
+    components: Vec<Box<dyn Component>>,
+    should_quit: bool,
+    should_suspend: bool,
+    mode: Mode,
+    last_tick_key_events: Vec<KeyEvent>,
+    action_tx: mpsc::UnboundedSender<Action>,
+    action_rx: mpsc::UnboundedReceiver<Action>,
 }
 
-#[derive(Debug)]
-struct TodoItem {
-    todo: String,
-    info: String,
-    status: Status,
-}
-
-#[derive(Debug, Default)]
-struct TodoList {
-    items: Vec<TodoItem>,
-    state: ListState,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-enum Status {
-    Todo,
-    Completed
+#[derive(Default, Debug, Copy, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum Mode {
+    #[default]
+    Home,
 }
 
 impl App {
-    /// Construct a new instance of [`App`].
-    pub fn new() -> Self {
-        Self::default()
+    pub fn new(tick_rate: f64, frame_rate: f64) -> Result<Self> {
+        let (action_tx, action_rx) = mpsc::unbounded_channel();
+        Ok(Self {
+            tick_rate,
+            frame_rate,
+            components: vec![Box::new(Home::new()), Box::new(FpsCounter::default())],
+            should_quit: false,
+            should_suspend: false,
+            config: Config::new()?,
+            mode: Mode::Home,
+            last_tick_key_events: Vec::new(),
+            action_tx,
+            action_rx,
+        })
     }
 
-    /// Run the application's main loop.
-    pub fn run(mut self, mut terminal: DefaultTerminal) -> io::Result<()> {
-        self.running = true;
-        while self.running {
-            terminal.draw(|frame| self.draw(frame))?;
-            self.handle_events()?;
+    pub async fn run(&mut self) -> Result<()> {
+        let mut tui = Tui::new()?
+            // .mouse(true) // uncomment this line to enable mouse support
+            .tick_rate(self.tick_rate)
+            .frame_rate(self.frame_rate);
+        tui.enter()?;
+
+        for component in self.components.iter_mut() {
+            component.register_action_handler(self.action_tx.clone())?;
         }
-        Ok(())
-    }
+        for component in self.components.iter_mut() {
+            component.register_config_handler(self.config.clone())?;
+        }
+        for component in self.components.iter_mut() {
+            component.init(tui.size()?)?;
+        }
 
-    fn handle_events(&mut self) -> io::Result<()> {
-        match event::read()? {
-            Event::Key(key_event) if key_event.kind == KeyEventKind::Press => {
-                self.handle_key_event(key_event)
+        let action_tx = self.action_tx.clone();
+        loop {
+            self.handle_events(&mut tui).await?;
+            self.handle_actions(&mut tui)?;
+            if self.should_suspend {
+                tui.suspend()?;
+                action_tx.send(Action::Resume)?;
+                action_tx.send(Action::ClearScreen)?;
+                // tui.mouse(true);
+                tui.enter()?;
+            } else if self.should_quit {
+                tui.stop()?;
+                break;
             }
-            _ => {}
+        }
+        tui.exit()?;
+        Ok(())
+    }
+
+    async fn handle_events(&mut self, tui: &mut Tui) -> Result<()> {
+        let Some(event) = tui.next_event().await else {
+            return Ok(());
         };
-        Ok(())
-    }
-
-    pub fn handle_key_event(&mut self, key_event: KeyEvent) {
-        match key_event.code {
-            KeyCode::Char('q') => self.exit(),
-            KeyCode::Char('h') => self.decrement_counter(),
-            KeyCode::Char('l') => self.increment_counter(),
+        let action_tx = self.action_tx.clone();
+        match event {
+            Event::Quit => action_tx.send(Action::Quit)?,
+            Event::Tick => action_tx.send(Action::Tick)?,
+            Event::Render => action_tx.send(Action::Render)?,
+            Event::Resize(x, y) => action_tx.send(Action::Resize(x, y))?,
+            Event::Key(key) => self.handle_key_event(key)?,
             _ => {}
         }
-    }
-
-    fn exit(&mut self) {
-        self.running = false;
-    }
-
-    fn decrement_counter(&mut self) {
-        self.counter -= 1;
-    }
-
-    fn increment_counter(&mut self) {
-        self.counter += 1;
-    }
-
-    pub fn draw(&self, frame: &mut Frame) {
-        frame.render_widget(self, frame.area());
-    }
-
-    /// Renders the user interface.
-    ///
-    /// This is where you add new widgets. See the following resources for more information:
-    ///
-    /// - <https://docs.rs/ratatui/latest/ratatui/widgets/index.html>
-    /// - <https://github.com/ratatui/ratatui/tree/main/ratatui-widgets/examples>
-    // fn render(&mut self, frame: &mut Frame) {
-    //     let title = Line::from("Ratatui Simple Template")
-    //         .bold()
-    //         .blue()
-    //         .centered();
-    //     let text = "Hello, Ratatui!\n\n\
-    //         Created using https://github.com/ratatui/templates\n\
-    //         Press `Esc`, `Ctrl-C` or `q` to stop running.";
-    //     frame.render_widget(
-    //         Paragraph::new(text)
-    //             .block(Block::bordered().title(title))
-    //             .centered(),
-    //         frame.area(),
-    //     )
-    // }
-
-    /// Reads the crossterm events and updates the state of [`App`].
-    ///
-    /// If your application needs to perform work in between handling events, you can use the
-    /// [`event::poll`] function to check if there are any events available with a timeout.
-    fn handle_crossterm_events(&mut self) -> Result<()> {
-        match event::read()? {
-            // it's important to check KeyEventKind::Press to avoid handling key release events
-            Event::Key(key) if key.kind == KeyEventKind::Press => self.on_key_event(key),
-            Event::Mouse(_) => {}
-            Event::Resize(_, _) => {}
-            _ => {}
+        for component in self.components.iter_mut() {
+            if let Some(action) = component.handle_events(Some(event.clone()))? {
+                action_tx.send(action)?;
+            }
         }
         Ok(())
     }
 
-    /// Handles the key events and updates the state of [`App`].
-    fn on_key_event(&mut self, key: KeyEvent) {
-        match (key.modifiers, key.code) {
-            (_, KeyCode::Esc | KeyCode::Char('q'))
-            | (KeyModifiers::CONTROL, KeyCode::Char('c') | KeyCode::Char('C')) => self.quit(),
-            // Add other key handlers here.
-            _ => {}
+    fn handle_key_event(&mut self, key: KeyEvent) -> Result<()> {
+        let action_tx = self.action_tx.clone();
+        let Some(keymap) = self.config.keybindings.get(&self.mode) else {
+            return Ok(());
+        };
+        match keymap.get(&vec![key]) {
+            Some(action) => {
+                info!("Got action: {action:?}");
+                action_tx.send(action.clone())?;
+            }
+            _ => {
+                // If the key was not handled as a single key action,
+                // then consider it for multi-key combinations.
+                self.last_tick_key_events.push(key);
+
+                // Check for multi-key combinations
+                if let Some(action) = keymap.get(&self.last_tick_key_events) {
+                    info!("Got action: {action:?}");
+                    action_tx.send(action.clone())?;
+                }
+            }
         }
+        Ok(())
     }
 
-    /// Set running to false to quit the application.
-    fn quit(&mut self) {
-        self.running = false;
+    fn handle_actions(&mut self, tui: &mut Tui) -> Result<()> {
+        while let Ok(action) = self.action_rx.try_recv() {
+            if action != Action::Tick && action != Action::Render {
+                debug!("{action:?}");
+            }
+            match action {
+                Action::Tick => {
+                    self.last_tick_key_events.drain(..);
+                }
+                Action::Quit => self.should_quit = true,
+                Action::Suspend => self.should_suspend = true,
+                Action::Resume => self.should_suspend = false,
+                Action::ClearScreen => tui.terminal.clear()?,
+                Action::Resize(w, h) => self.handle_resize(tui, w, h)?,
+                Action::Render => self.render(tui)?,
+                _ => {}
+            }
+            for component in self.components.iter_mut() {
+                if let Some(action) = component.update(action.clone())? {
+                    self.action_tx.send(action)?
+                };
+            }
+        }
+        Ok(())
     }
-}
 
-impl Widget for &App {
-    fn render(self, area: Rect, buf: &mut Buffer) {
-        let title = Line::from(" Counter App Tutorial ".bold());
-        let instructions = Line::from(vec![
-            " Decrement ".into(),
-            "<Left>".blue().bold(),
-           " Increment ".into(),
-            "<Right>".blue().bold(),
-            " Quit ".into(),
-            "<Q> ".blue().bold(),
-        ]);
-        let block = Block::bordered()
-            .title(title.centered())
-            .title_bottom(instructions.centered())
-            .border_set(border::THICK);
-
-        let counter_text = Text::from(vec![Line::from(vec![
-            "Value: ".into(),
-            self.counter.to_string().yellow(),
-        ])]);
-
-        Paragraph::new(counter_text)
-            .centered()
-            .block(block)
-            .render(area, buf);
+    fn handle_resize(&mut self, tui: &mut Tui, w: u16, h: u16) -> Result<()> {
+        tui.resize(Rect::new(0, 0, w, h))?;
+        self.render(tui)?;
+        Ok(())
     }
-}
 
-impl Widget for &App {
-    fn render(self, area: Rect: buf: &mut Buffer) {
-
+    fn render(&mut self, tui: &mut Tui) -> Result<()> {
+        tui.draw(|frame| {
+            for component in self.components.iter_mut() {
+                if let Err(err) = component.draw(frame, frame.area()) {
+                    let _ = self
+                        .action_tx
+                        .send(Action::Error(format!("Failed to draw: {:?}", err)));
+                }
+            }
+        })?;
+        Ok(())
     }
 }
